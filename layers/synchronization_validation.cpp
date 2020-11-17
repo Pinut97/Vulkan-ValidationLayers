@@ -223,6 +223,169 @@ static inline ResourceAccessRange MakeRange(const BUFFER_VIEW_STATE &buf_view_st
     return MakeRange(*buf_view_state.buffer_state.get(), buf_view_state.create_info.offset, buf_view_state.create_info.range);
 }
 
+// Range generators for to allow event scope filtration to be limited to the top of the resource access traversal pipeline
+//
+// Usage:
+//  begin() -- initializes the generator to point to the begin of the space declared.  Only safe *once* at construction.
+//             This limitation specifically for the filter vs. image range generator case, where no "begin" behavior
+//             is assumed for the image range generator.
+//  *  -- the current range of the generator empty signfies end
+//  ++ -- advance to the next non-empty range (or end)
+//  end() -- to allow ranged loop constructs to be used
+
+// A wrapper for a single range with the same semantics as the actual generators below
+template <typename KeyType>
+class SingleRangeGenerator {
+  public:
+    SingleRangeGenerator(const KeyType &range) : current_() {}
+    KeyType &operator*() const { return *current_; }
+    KeyType *operator->() const { return &*current_; }
+    SingleRangeGenerator &operator++() {
+        current_ = KeyType();  // just one real range
+    }
+
+    SingleRangeGenerator &begin() { current_ = range_; }
+
+    SingleRangeGenerator &end() const { return SingleRangeGenerator(); }
+
+    bool operator==(const SingleRangeGenerator &other) const { return current_ == other.current_; }
+
+  private:
+    SingleRangeGenerator() = default;
+    const KeyType range_;
+    KeyType current_;
+};
+
+// Generate the ranges that are the intersection of range and the entries in the FilterMap
+template <typename FilterMap, typename KeyType = typename FilterMap::key_type>
+class FilteredRangeGenerator {
+  public:
+    FilteredRangeGenerator(const KeyType &range, const FilterMap &filter)
+        : range_(range), filter_(&filter), filter_pos_(), current_(end_pos()) {}
+    KeyType &operator*() const { return *current_; }
+    KeyType *operator->() const { return &*current_; }
+    FilteredRangeGenerator &operator++() {
+        ++filter_pos_;
+        UpdateCurrent();
+        return *this;
+    }
+
+    // Note the side effect... calling begin *resets* the generator.  Works here, but not in all Filter*Generators
+    FilteredRangeGenerator &begin() {
+        filter_pos_ = filter_map.lower_bound(range_);
+        UpdateCurrent();
+    }
+
+    FilteredRangeGenerator &end() const { return FilteredRangeGenerator(); }
+
+    bool operator==(const FilteredRangeGenerator &other) const { return current_ == other.current_; }
+
+  private:
+    FilteredRangeGenerator() = default;
+    void UpdateCurrent() {
+        if (filter_pos_ != filter_map_.cend()) {
+            current_ = range_ & filter_pos_->first;
+        } else {
+            current_ = KeyType();
+        }
+    }
+    const KeyType range_;
+    const FilterMap *filter_;
+    typename FilterMap::const_iterator filter_pos_;
+    KeyType current_;
+};
+
+// Generate the ranges that are the intersection of the RangeGen ranges and the entries in the FilterMap
+// Note that begin *cannot* reset RangeGen (image range generation currently doesn't support it), so you can only iterate over
+// this generator once.
+template <typename FilterMap, typename RangeGen, typename KeyType = typename FilterMap::key_type>
+class FilteredGeneratorGenerator {
+    FilteredGeneratorGenerator(const FilterMap &filter, RangeGen &gen) : filter_(&filter), gen_(&gen), filter_pos_(), current_() {}
+    KeyType &operator*() const { return *current_; }
+    KeyType *operator->() const { return &*current_; }
+    FilteredGeneratorGenerator &operator++() {
+        auto gen_range = *gen_;
+        auto filter_range = FilterRange();
+        current_ = KeyType();
+        while (gen_range.valid() && filter_range.valid() && current_.empty()) {
+            if (gen_range.end > filter_range.end) {
+                // if the generated range is beyond the filter_range, advance the filter range
+                filter_range = AdvanceFilter();
+            } else {
+                gen_range = AdvanceGen();
+            }
+            current_ = gen_range & filter_range;
+        }
+    }
+    FilteredGeneratorGenerator &begin() {
+        auto gen_range = *gen_;
+        if (gen_range.empty()) {
+            current_ = KeyType();
+            filter_pos_ = filter->cend();
+        } else {
+            filter_pos_ = filter_->find(gen_range);
+            current_ = *gen_range & FilterRange();
+        }
+        return *this;
+    }
+    FilteredGeneratorGenerator &end() const { return FilteredGeneratorGenerator(); }
+
+    bool operator==(const FilteredGeneratorGenerator &other) const { return current_ == other.current_; }
+
+  private:
+    void AdvanceFilter() {
+        ++filter_pos_;
+        auto filter_range = FilterRange();
+        if (filter_range.valid()) {
+            FastForwardGen(filter_range);
+        }
+    }
+    void AdvanceGen() {
+        ++gen_;
+        auto gen_range = *gen_;
+        if (gen_range.valid()) {
+            FastForwardFilter(gen_range);
+        }
+    }
+
+    KeyType FilterRange() const { return (filter_pos_ != filter_->cend()) filter_pos_->first : KeyType(); }
+
+    KeyType FastFowardFilter(const KeyType &range) {
+        auto filter_range = FilterRange();
+        int retry_count = 0;
+        const static int kRetryLimit = 2;  // TODO -- determine wheter this limit is optimal
+        while (!filter_range.empty() && (filter_range.end <= range.begin)) {
+            if (retry_count < kRetryLimit) {
+                ++filter_pos_;
+                filter_range = FilterRange();
+                retry_count++;
+            } else {
+                // Okay we've tried walking, do a seek.
+                filter_pos_ = filter_->lower_bound(range);
+                break;
+            }
+        }
+        return FilterRange();
+    }
+
+    // TODO: Consider adding "seek" (or an absolute bound "get" to range generators to make this walk
+    // faster.
+    KeyType FastFowardGen(const KeyType &range) {
+        auto gen_range = *gen_;
+        while (!gen_range.empty() && (gen_range.end <= range.begin)) {
+            ++gen_;
+            gen_range = *gen_;
+        }
+        return gen_range;
+    }
+
+    FilteredGeneratorGenerator() = default;
+    const FilterMap *filter_;
+    RangeGen *const gen_;
+    typename FilterMap::const_iterator filter_pos_;
+    KeyType current_;
+};
+
 // Expand the pipeline stage without regard to whether the are valid w.r.t. queue or extension
 VkPipelineStageFlags ExpandPipelineStages(VkQueueFlags queue_flags, VkPipelineStageFlags stage_mask) {
     VkPipelineStageFlags expanded = stage_mask;
@@ -500,6 +663,16 @@ HazardResult AccessContext::DetectPreviousHazard(AccessAddressType type, const D
         hazard = detector.Detect(prev);
     }
     return hazard;
+}
+
+template <typename Action>
+void AccessContext::ForAll(Action &&action) {
+    for (const auto address_type : kAddressTypes) {
+        auto &accesses = GetAccessStateMap(address_type);
+        for (const auto &access : accesses) {
+            action(address_type, access);
+        }
+    }
 }
 
 // A recursive range walker for hazard detection, first for the current context and the (DetectHazardRecur) to walk
@@ -1078,6 +1251,62 @@ class BarrierHazardDetector {
     VkPipelineStageFlags src_exec_scope_;
     SyncStageAccessFlags src_access_scope_;
 };
+
+class EventBarrierHazardDetector {
+  public:
+    EventBarrierHazardDetector(SyncStageAccessIndex usage_index, VkPipelineStageFlags src_exec_scope,
+                               SyncStageAccessFlags src_access_scope, const SyncEventState::ScopeMap &event_scope,
+                               const ResourceUsageTag &scope_tag)
+        : usage_index_(usage_index),
+          src_exec_scope_(src_exec_scope),
+          src_access_scope_(src_access_scope),
+          event_scope_(event_scope),
+          scope_pos_(event_scope.cbegin()),
+          scope_end_(event_scope.cend()),
+          scope_tag_(scope_tag) {}
+
+    HazardResult Detect(const ResourceAccessRangeMap::const_iterator &pos) const {
+        // TODO NOTE: This is almost the slowest way to do this... need to intelligently walk this...
+        // Need to find a more efficient sync, since we know pos->first is strictly increasing call to call
+        // NOTE: "cached_lower_bound_impl" with upgrades could do this.
+        if (scope_pos_ == scope_end_) return HazardResult();
+        if (!scope_pos_->first.intersects(pos->first)) {
+            event_scope_.lower_bound(pos->first);
+            if ((scope_pos_ == scope_end_) || !scope_pos_->first.intersects(pos->first)) return HazardResult();
+        }
+
+        // Some portion of this pos is in the event_scope, so check for a barrier hazard
+        return pos->second.DetectBarrierHazard(usage_index_, src_exec_scope_, src_access_scope_, scope_tag_);
+    }
+    HazardResult DetectAsync(const ResourceAccessRangeMap::const_iterator &pos) const {
+        // Async barrier hazard detection can use the same path as the usage index is not IsRead, but is IsWrite
+        return pos->second.DetectAsyncHazard(usage_index_);
+    }
+
+  private:
+    SyncStageAccessIndex usage_index_;
+    VkPipelineStageFlags src_exec_scope_;
+    SyncStageAccessFlags src_access_scope_;
+    const SyncEventState::ScopeMap &event_scope_;
+    SyncEventState::ScopeMap::const_iterator scope_pos_;
+    SyncEventState::ScopeMap::const_iterator scope_end_;
+    const ResourceUsageTag &scope_tag_;
+};
+
+HazardResult AccessContext::DetectImageBarrierHazard(const IMAGE_STATE &image, VkPipelineStageFlags src_exec_scope,
+                                                     const SyncStageAccessFlags &src_access_scope,
+                                                     const VkImageSubresourceRange &subresource_range,
+                                                     const SyncEventState &sync_event, DetectOptions options) const {
+    // It's not particularly DRY to get the address type in this function as well as lower down, but we have to select the
+    // first access scope map to use, and there's no easy way to plumb it in below.
+    const auto address_type = ImageAddressType(image);
+    const auto &event_scope = sync_event.FirstScope(address_type);
+
+    EventBarrierHazardDetector detector(SyncStageAccessIndex::SYNC_IMAGE_LAYOUT_TRANSITION, src_exec_scope, src_access_scope,
+                                        event_scope, sync_event.first_scope_tag);
+    VkOffset3D zero_offset = {0, 0, 0};
+    return DetectHazard(detector, image, subresource_range, zero_offset, image.createInfo.extent, options);
+}
 
 HazardResult AccessContext::DetectImageBarrierHazard(const IMAGE_STATE &image, VkPipelineStageFlags src_exec_scope,
                                                      const SyncStageAccessFlags &src_access_scope,
@@ -1879,17 +2108,159 @@ void CommandBufferAccessContext::RecordEndRenderPass(const RENDER_PASS_STATE &re
 
 bool CommandBufferAccessContext::ValidateSetEvent(VkCommandBuffer commandBuffer, VkEvent event,
                                                   VkPipelineStageFlags stageMask) const {
-    return false;
+    // I'll put this here just in case we need to pass this in for future extension support
+    const auto cmd = CMD_SETEVENT;
+    bool skip = false;
+    const auto *sync_event = GetEventState(event);
+    if (!sync_event) return false;  // Core, Lifetimes, or Param check needs to catch invalid events.
+
+    const char *const reset_set =
+        "%s: %s %s operation following %s without intervening execution barrier, is a race condition and may result in data "
+        "hazards.";
+    const char *const wait =
+        "%s: %s %s operation following %s without intervening vkCmdResetEvent, may result in data hazard and is ignored.";
+    const char *vuid = nullptr;
+    const char *message = nullptr;
+    switch (sync_event->last_command) {
+        case CMD_RESETEVENT:
+            // Needs a barrier between reset and set
+            if (!sync_event->barrier_since_last) {
+                vuid = "SYNC-vkCmdSetEvent-missingbarrier-reset";
+                message = reset_set;
+            }
+            break;
+        case CMD_SETEVENT:
+            // Needs a barrier between set and set
+            if (!sync_event->barrier_since_last) {
+                vuid = "SYNC-vkCmdSetEvent-missingbarrier-set";
+                message = reset_set;
+            }
+            break;
+        case CMD_WAITEVENTS: {
+            // Needs a barrier or is in second execution scope
+            const auto src_exec_scope = WithEarlierPipelineStages(ExpandPipelineStages(GetQueueFlags(), stageMask));
+            if (!sync_event->barrier_since_last && (0 == (sync_event->last_wait_dst_stage_mask & src_exec_scope))) {
+                vuid = "SYNC-vkCmdSetEvent-missingbarrier-wait";
+                message = wait;
+                break;
+            }
+        }
+        default:
+            // The only other valid last command that wasn't one.
+            assert(sync_event->last_command == CMD_NONE);
+            break;
+    }
+    if (vuid) {
+        assert(nullptr != message);
+        const char *const cmd_name = CommandTypeString(cmd);
+        skip |= sync_state_->LogError(event, vuid, message, cmd_name, sync_state_->report_data->FormatHandle(event).c_str(),
+                                      cmd_name, CommandTypeString(sync_event->last_command));
+    }
+    return skip;
 }
 
-void CommandBufferAccessContext::RecordSetEvent(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags stageMask) {}
+void CommandBufferAccessContext::RecordSetEvent(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags stageMask,
+                                                const ResourceUsageTag &tag) {
+    auto *sync_event = GetEventState(event);
+    if (!sync_event) return;  // Core, Lifetimes, or Param check needs to catch invalid events.
+
+    // NOTE: We're going to simply record the sync scope here, as anything else would be implementation defined/undefined
+    //       and we're issuing errors re: missing barriers between event commands, which if the user fixes would fix
+    //       any issues caused by naive scope setting here.
+
+    // What happens with two SetEvent is that one cannot know what group of operations will be waited for.
+    // Given:
+    //     Stuff1; SetEvent; Stuff2; SetEvent; WaitEvents;
+    // WaitEvents cannot know which of Stuff1, Stuff2, or both has completed execution.
+    if (!sync_event->barrier_since_last && (sync_event->last_command != CMD_SETEVENT)) {
+        sync_event->ResetFirstScope();
+        sync_event->unsynchronized_set_set;
+    } else if ((sync_event->last_command != CMD_WAITEVENTS)) {
+        // We'll skip updating the first sync scope map only for Wait;Set -- as we can be sure (that for the cases we care about
+        // the Set will be noop'd.  Whether it is or not is undefined. (or at best implementation dependent)
+        const auto exec_scope = WithEarlierPipelineStages(ExpandPipelineStages(GetQueueFlags(), stageMask));
+        // We use the expanded and logically earlier, and us the expanded definition for access to catch every possible write at
+        // those stages, as we don't know what the srcAccessMask will be until Wait time
+        const auto scope_accesses = SyncStageAccess::AccessScopeByStage(exec_scope);
+        // What happens with two SetEvent calls is undefined, so pick the easiest to implement, each Set nukes the previous
+        auto set_scope = [&sync_event, exec_scope, scope_accesses](AccessAddressType address_type,
+                                                                   const ResourceAccessRangeMap::value_type &access) {
+            auto &scope_map = sync_event->first_scope[static_cast<size_t>(address_type)];
+            if (access.second.InSourceScopeOrChain(exec_scope, scope_accesses)) {
+                scope_map.insert(scope_map.end(), std::make_pair(access.first, true));
+            }
+        };
+        GetCurrentAccessContext()->ForAll(set_scope);
+        sync_event->unsynchronized_set_set = false;
+        sync_event->first_scope_tag = tag;
+    }
+    sync_event->last_command = CMD_SETEVENT;
+    sync_event->barrier_since_last = false;
+    sync_event->last_wait_dst_stage_mask = 0;
+    sync_event->set_stage_mask = stageMask;
+}
 
 bool CommandBufferAccessContext::ValidateResetEvent(VkCommandBuffer commandBuffer, VkEvent event,
                                                     VkPipelineStageFlags stageMask) const {
-    return false;
+    // I'll put this here just in case we need to pass this in for future extension support
+    const auto cmd = CMD_RESETEVENT;
+
+    bool skip = false;
+    // TODO: EVENTS:
+    // What is it we need to check... that we've had a reset since a set?  Set/Set seems ill formed...
+    const auto *sync_event = GetEventState(event);
+    if (!sync_event) return false;  // Core, Lifetimes, or Param check needs to catch invalid events.
+
+    const char *const set_wait =
+        "%s: %s %s operation following %s without intervening execution barrier, is a race condition and may result in data "
+        "hazards.";
+    const char *message = set_wait;  // Only one message this call.
+    const char *vuid = nullptr;
+    switch (sync_event->last_command) {
+        case CMD_SETEVENT:
+            // Needs a barrier between set and set
+            if (!sync_event->barrier_since_last) {
+                vuid = "SYNC-vkCmdResetEvent-missingbarrier-set";
+            }
+            break;
+        case CMD_WAITEVENTS: {
+            // Needs a barrier or is in second execution scope
+            const auto exec_scope = WithEarlierPipelineStages(ExpandPipelineStages(GetQueueFlags(), stageMask));
+            if (!sync_event->barrier_since_last && (0 == (sync_event->last_wait_dst_stage_mask & exec_scope))) {
+                vuid = "SYNC-vkCmdResetEvent-missingbarrier-wait";
+                break;
+            }
+        }
+        default:
+            // The only other valid last command that wasn't one.
+            assert((sync_event->last_command == CMD_NONE) || (sync_event->last_command == CMD_RESETEVENT));
+            break;
+    }
+    if (vuid) {
+        const char *const cmd_name = CommandTypeString(cmd);
+        skip |= sync_state_->LogError(event, vuid, message, cmd_name, sync_state_->report_data->FormatHandle(event).c_str(),
+                                      cmd_name, CommandTypeString(sync_event->last_command));
+    }
+    return skip;
 }
 
-void CommandBufferAccessContext::RecordResetEvent(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags stageMask) {}
+void CommandBufferAccessContext::RecordResetEvent(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags stageMask) {
+    const auto cmd = CMD_RESETEVENT;
+    auto *sync_event = GetEventState(event);
+    if (!sync_event) return;
+
+    // Clear out the first sync scope, any races vs. wait or set are reported, so we'll keep the bookkeeping simple assuming
+    // the safe case
+    for (const auto address_type : kAddressTypes) {
+        sync_event->first_scope[static_cast<const size_t>(address_type)].clear();
+    }
+
+    // Update the event state
+    sync_event->last_command = cmd;
+    sync_event->barrier_since_last = false;
+    sync_event->unsynchronized_set_set = false;
+    sync_event->last_wait_dst_stage_mask = 0;
+}
 
 bool CommandBufferAccessContext::ValidateWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkEvent *pEvents,
                                                     VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask,
@@ -1898,7 +2269,64 @@ bool CommandBufferAccessContext::ValidateWaitEvents(VkCommandBuffer commandBuffe
                                                     const VkBufferMemoryBarrier *pBufferMemoryBarriers,
                                                     uint32_t imageMemoryBarrierCount,
                                                     const VkImageMemoryBarrier *pImageMemoryBarriers) const {
-    return false;
+    const auto cmd = CMD_WAITEVENTS;
+    bool skip = false;
+    for (uint32_t event_index = 0; event_index < eventCount; event_index++) {
+        const auto event = pEvents[event_index];
+        const auto *sync_event = GetEventState(event);
+        if (!sync_event) continue;  // Core, Lifetimes, or Param check needs to catch invalid events.
+
+        if (sync_event->last_command == CMD_RESETEVENT && !sync_event->barrier_since_last) {
+            const char *const cmd_name = CommandTypeString(cmd);
+            const char *const vuid = "SYNC-vkCmdWaitEvents-missingbarrier-reset";
+            const char *const message =
+                "%s: %s %s operation following %s without intervening execution barrier, may cause race condition";
+            skip |= sync_state_->LogError(event, vuid, message, cmd_name, sync_state_->report_data->FormatHandle(event).c_str(),
+                                          cmd_name, CommandTypeString(sync_event->last_command));
+            continue;
+        }
+        if ((sync_event->last_command == CMD_SETEVENT) && sync_event->unsynchronized_set_set) {
+            // Issue error message that Wait is waiting on an signal subject to race condition, and is thus ignored for this event
+            const char *const cmd_name = CommandTypeString(cmd);
+            const char *const vuid = "SYNC-vkCmdWaitEvents-unsynchronized-setops";
+            const char *const message =
+                "%s: %s Multiple unsychronized %s calls result in race conditions w.r.t. event signalling. %s";
+            const char *const dire_warning =
+                "As first synchronization scope is undefined, wait operation is ignored for this event.";
+            skip |= sync_state_->LogError(event, vuid, message, cmd_name, sync_state_->report_data->FormatHandle(event).c_str(),
+                                          CommandTypeString(sync_event->last_command), dire_warning);
+
+        } else if (imageMemoryBarrierCount) {
+            const auto src_stage_mask = ExpandPipelineStages(GetQueueFlags(), sync_event->set_stage_mask);
+            auto src_stage_accesses = SyncStageAccess::AccessScopeByStage(src_stage_mask);
+
+            const auto src_exec_scope = WithEarlierPipelineStages(src_stage_mask);
+            const auto *context = GetCurrentAccessContext();
+            assert(context);
+            for (uint32_t barrier_index = 0; barrier_index < imageMemoryBarrierCount; barrier_index++) {
+                const auto &barrier = pImageMemoryBarriers[barrier_index];
+                if (barrier.oldLayout == barrier.newLayout) continue;
+                const auto *image_state = sync_state_->Get<IMAGE_STATE>(barrier.image);
+                if (!image_state) continue;
+                auto subresource_range = NormalizeSubresourceRange(image_state->createInfo, barrier.subresourceRange);
+                const auto src_access_scope = SyncStageAccess::AccessScope(src_stage_accesses, barrier.srcAccessMask);
+                const auto hazard =
+                    context->DetectImageBarrierHazard(*image_state, src_exec_scope, src_access_scope, subresource_range,
+                                                      *sync_event, AccessContext::DetectOptions::kDetectAll);
+                if (hazard.hazard) {
+                    const char *const cmd_name = CommandTypeString(cmd);
+                    skip |= sync_state_->LogError(barrier.image, string_SyncHazardVUID(hazard.hazard),
+                                                  "%s: Hazard %s for image barrier %" PRIu32 " %s. Access info %s.",
+                                                  string_SyncHazard(hazard.hazard), barrier_index,
+                                                  sync_state_->report_data->FormatHandle(barrier.image).c_str(),
+                                                  string_UsageTag(hazard).c_str());
+                    break;
+                }
+            }
+        }
+    }
+
+    return skip;
 }
 
 void CommandBufferAccessContext::RecordWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkEvent *pEvents,
@@ -1908,6 +2336,23 @@ void CommandBufferAccessContext::RecordWaitEvents(VkCommandBuffer commandBuffer,
                                                   const VkBufferMemoryBarrier *pBufferMemoryBarriers,
                                                   uint32_t imageMemoryBarrierCount,
                                                   const VkImageMemoryBarrier *pImageMemoryBarriers) const {}
+
+SyncEventState *CommandBufferAccessContext::GetEventState(VkEvent event) {
+    auto &event_up = event_state_[event];
+    if (!event_up) {
+        auto event_atate = sync_state_->GetShared<EVENT_STATE>(event);
+        event_up.reset(new SyncEventState(event_atate));
+    }
+    return event_up.get();
+}
+
+const SyncEventState *CommandBufferAccessContext::GetEventState(VkEvent event) const {
+    auto &event_it = event_state_.find(event);
+    if (event_it == event_state_.cend()) {
+        return nullptr;
+    }
+    return event_it->second.get();
+}
 
 bool RenderPassAccessContext::ValidateDrawSubpassAttachment(const SyncValidator &sync_state, const CMD_BUFFER_STATE &cmd,
                                                             const VkRect2D &render_area, const char *func_name) const {
@@ -2387,21 +2832,58 @@ HazardResult ResourceAccessState::DetectBarrierHazard(SyncStageAccessIndex usage
         // Look at the reads if any
         for (uint32_t read_index = 0; read_index < last_read_count; read_index++) {
             const auto &read_access = last_reads[read_index];
-            // If the read stage is not in the src sync sync
-            // *AND* not execution chained with an existing sync barrier (that's the or)
-            // then the barrier access is unsafe (R/W after R)
-            if ((src_exec_scope & (read_access.stage | read_access.barriers)) == 0) {
+            if (read_access.IsReadBarrierHazard(src_exec_scope)) {
                 hazard.Set(this, usage_index, WRITE_AFTER_READ, read_access.access, read_access.tag);
                 break;
             }
         }
+    } else if (last_write.any() && IsWriteBarrierHazard(src_exec_scope, src_access_scope)) {
+        hazard.Set(this, usage_index, WRITE_AFTER_WRITE, last_write, write_tag);
+    }
+
+    return hazard;
+}
+
+HazardResult ResourceAccessState::DetectBarrierHazard(SyncStageAccessIndex usage_index, VkPipelineStageFlags src_exec_scope,
+                                                      const SyncStageAccessFlags &src_access_scope,
+                                                      const ResourceUsageTag &event_tag) const {
+    // Only supporting image layout transitions for now
+    assert(usage_index == SyncStageAccessIndex::SYNC_IMAGE_LAYOUT_TRANSITION);
+    HazardResult hazard;
+    // only test for WAW if there no intervening read operations.
+    // See DetectHazard(SyncStagetAccessIndex) above for more details.
+    bool scoped_read_found = false;
+
+    if (last_read_count) {
+        // Look at the reads if any... if reads exist, they are either the resaon the access is in the event
+        // first scope, or they are a hazard.
+        for (uint32_t read_index = 0; read_index < last_read_count; read_index++) {
+            const auto &read_access = last_reads[read_index];
+            if (read_access.tag.IsBefore(event_tag)) {
+                // The read is in the events first synchronization scope, so we use a barrier hazard check
+                scoped_read_found = true;
+                // If the read stage is not in the src sync scope
+                // *AND* not execution chained with an existing sync barrier (that's the or)
+                // then the barrier access is unsafe (R/W after R)
+                if (read_access.IsReadBarrierHazard(src_exec_scope)) {
+                    hazard.Set(this, usage_index, WRITE_AFTER_READ, read_access.access, read_access.tag);
+                    break;
+                }
+            } else {
+                // The read not in the event first sync scope and so is a hazard vs. the layout transition
+                hazard.Set(this, usage_index, WRITE_AFTER_READ, read_access.access, read_access.tag);
+            }
+        }
     } else if (last_write.any()) {
-        // If the previous write is *not* in the 1st access scope
-        // *AND* the current barrier is not in the dependency chain
-        // *AND* the there is no prior memory barrier for the previous write in the dependency chain
-        // then the barrier access is unsafe (R/W after W)
-        if (((last_write & src_access_scope) == 0) && ((src_exec_scope & write_dependency_chain) == 0) && (write_barriers == 0)) {
-            // TODO: Do we need a difference hazard name for this?
+        // if there are no reads, the write is either the reason the access is in the event scope... they are a hazard
+        if (write_tag.IsBefore(event_tag)) {
+            // The write is in the first sync scope of the event (sync their aren't any reads to be the reason)
+            // So do a normal barrier hazard check
+            if (IsWriteBarrierHazard(src_exec_scope, src_access_scope)) {
+                hazard.Set(this, usage_index, WRITE_AFTER_WRITE, last_write, write_tag);
+            }
+        } else {
+            // The write isn't in scope, and is thus a hazard to the layout transistion for wait
             hazard.Set(this, usage_index, WRITE_AFTER_WRITE, last_write, write_tag);
         }
     }
@@ -2537,7 +3019,7 @@ void ResourceAccessState::ApplyBarrier(const SyncBarrier &barrier, bool layout_t
     //       transistion, under the theory of "most recent access".  If the read/write *isn't* safe
     //       vs. this layout transition DetectBarrierHazard should report it.  We treat the layout
     //       transistion *as* a write and in scope with the barrier (it's before visibility).
-    if (layout_transition || InSourceScopeOrChain(barrier.src_exec_scope, barrier.src_access_scope)) {
+    if (layout_transition || WriteInSourceScopeOrChain(barrier.src_exec_scope, barrier.src_access_scope)) {
         pending_write_barriers |= barrier.dst_access_scope;
         pending_write_dep_chain |= barrier.dst_exec_scope;
     }
@@ -2720,7 +3202,6 @@ bool SyncValidator::PreCallValidateCmdCopyBuffer(VkCommandBuffer commandBuffer, 
             const ResourceAccessRange src_range = MakeRange(*src_buffer, copy_region.srcOffset, copy_region.size);
             auto hazard = context->DetectHazard(*src_buffer, SYNC_TRANSFER_TRANSFER_READ, src_range);
             if (hazard.hazard) {
-                // TODO -- add tag information to log msg when useful.
                 skip |= LogError(srcBuffer, string_SyncHazardVUID(hazard.hazard),
                                  "vkCmdCopyBuffer: Hazard %s for srcBuffer %s, region %" PRIu32 ". Access info %s.",
                                  string_SyncHazard(hazard.hazard), report_data->FormatHandle(srcBuffer).c_str(), region,
@@ -4492,8 +4973,8 @@ void SyncValidator::PostCallRecordCmdSetEvent(VkCommandBuffer commandBuffer, VkE
     auto *cb_context = GetAccessContext(commandBuffer);
     assert(cb_context);
     if (!cb_context) return;
-
-    cb_context->RecordSetEvent(commandBuffer, event, stageMask);
+    const auto tag = cb_context->NextCommandTag(CMD_SETEVENT);
+    cb_context->RecordSetEvent(commandBuffer, event, stageMask, tag);
 }
 
 bool SyncValidator::PreCallValidateCmdResetEvent(VkCommandBuffer commandBuffer, VkEvent event,
@@ -4550,4 +5031,10 @@ void SyncValidator::PostCallRecordCmdWaitEvents(VkCommandBuffer commandBuffer, u
     cb_context->RecordWaitEvents(commandBuffer, eventCount, pEvents, srcStageMask, dstStageMask, memoryBarrierCount,
                                  pMemoryBarriers, bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount,
                                  pImageMemoryBarriers);
+}
+
+void SyncEventState::ResetFirstScope() {
+    for (const auto address_type : kAddressTypes) {
+        first_scope[static_cast<const size_t>(address_type)].clear();
+    }
 }
