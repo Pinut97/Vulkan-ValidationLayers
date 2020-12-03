@@ -411,7 +411,6 @@ class AccessContext {
                                    uint32_t subpass) const;
 
   private:
-    HazardResult DetectHazard(AccessAddressType type, SyncStageAccessIndex usage_index, const ResourceAccessRange &range) const;
     template <typename Detector>
     HazardResult DetectHazard(AccessAddressType type, const Detector &detector, const ResourceAccessRange &range,
                               DetectOptions options) const;
