@@ -129,7 +129,9 @@ struct SyncEventState {
     bool barrier_since_last;
     bool unsynchronized_set_set;
     VkPipelineStageFlags last_wait_dst_stage_mask;
-    VkPipelineStageFlags set_stage_mask;
+    VkPipelineStageFlags stage_mask;
+    VkPipelineStageFlags exec_scope;
+    SyncStageAccessFlags stage_accesses;
     ResourceUsageTag first_scope_tag;
     std::array<ScopeMap, static_cast<size_t>(AccessAddressType::kTypeCount)> first_scope;
     SyncEventState(const EventPointer &event_state)
@@ -138,7 +140,9 @@ struct SyncEventState {
           barrier_since_last(false),
           unsynchronized_set_set(false),
           last_wait_dst_stage_mask(0U),
-          set_stage_mask(0U) {}
+          stage_mask(0U),
+          exec_scope(0U),
+          stage_accesses() {}
     SyncEventState() : SyncEventState(EventPointer()) {}
     void ResetFirstScope();
     const ScopeMap &FirstScope(AccessAddressType address_type) const { return first_scope[static_cast<size_t>(address_type)]; }
@@ -362,6 +366,14 @@ class AccessContext {
     void RecordLayoutTransitions(const RENDER_PASS_STATE &rp_state, uint32_t subpass,
                                  const std::vector<const IMAGE_VIEW_STATE *> &attachment_views, const ResourceUsageTag &tag);
 
+    void ApplyBufferBarriers(const SyncValidator &sync_state, const SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
+                             const SyncStageAccessFlags &dst_stage_accesses, uint32_t barrier_count,
+                             const VkBufferMemoryBarrier *barriers);
+
+    void ApplyImageBarriers(const SyncValidator &sync_state, const SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
+                            const SyncStageAccessFlags &dst_stage_accesses, uint32_t barrier_count,
+                            const VkImageMemoryBarrier *barriers, const ResourceUsageTag &tag);
+
     const TrackBack &GetDstExternalTrackBack() const { return dst_external_; }
     void Reset() {
         prev_.clear();
@@ -413,9 +425,14 @@ class AccessContext {
     template <typename Action>
     void UpdateResourceAccess(const IMAGE_STATE &image, const VkImageSubresourceRange &subresource_range, const Action action);
 
+    template <typename Action, typename RangeGen>
+    void UpdateResourceAccess(AccessAddressType address_type, const Action &action, RangeGen *range_gen);
+
     template <typename Action>
     void ApplyGlobalBarriers(const Action &barrier_action);
-
+    void AccessContext::ApplyGlobalBarriers(const SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
+                                            const SyncStageAccessFlags &dst_stage_accesses, uint32_t memory_barrier_count,
+                                            const VkMemoryBarrier *pMemoryBarriers, const ResourceUsageTag &tag);
     static AccessAddressType ImageAddressType(const IMAGE_STATE &image);
 
     AccessContext(uint32_t subpass, VkQueueFlags queue_flags, const std::vector<SubpassDependencyGraphNode> &dependencies,

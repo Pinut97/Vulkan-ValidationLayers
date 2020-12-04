@@ -242,6 +242,7 @@ class SingleRangeGenerator {
     KeyType *operator->() const { return &*current_; }
     SingleRangeGenerator &operator++() {
         current_ = KeyType();  // just one real range
+        return *this;
     }
 
     SingleRangeGenerator &begin() { current_ = range_; }
@@ -260,10 +261,10 @@ class SingleRangeGenerator {
 template <typename FilterMap, typename KeyType = typename FilterMap::key_type>
 class FilteredRangeGenerator {
   public:
-    FilteredRangeGenerator(const KeyType &range, const FilterMap &filter)
-        : range_(range), filter_(&filter), filter_pos_(), current_(end_pos()) {}
-    KeyType &operator*() const { return *current_; }
-    KeyType *operator->() const { return &*current_; }
+    FilteredRangeGenerator(const FilterMap &filter, const KeyType &range)
+        : range_(range), filter_(&filter), filter_pos_(), current_() {}
+    const KeyType &operator*() const { return current_; }
+    const KeyType *operator->() const { return &current_; }
     FilteredRangeGenerator &operator++() {
         ++filter_pos_;
         UpdateCurrent();
@@ -272,7 +273,7 @@ class FilteredRangeGenerator {
 
     // Note the side effect... calling begin *resets* the generator.  Works here, but not in all Filter*Generators
     FilteredRangeGenerator &begin() {
-        filter_pos_ = filter_map.lower_bound(range_);
+        filter_pos_ = filter_->lower_bound(range_);
         UpdateCurrent();
     }
 
@@ -283,7 +284,7 @@ class FilteredRangeGenerator {
   private:
     FilteredRangeGenerator() = default;
     void UpdateCurrent() {
-        if (filter_pos_ != filter_map_.cend()) {
+        if (filter_pos_ != filter_->cend()) {
             current_ = range_ & filter_pos_->first;
         } else {
             current_ = KeyType();
@@ -294,18 +295,22 @@ class FilteredRangeGenerator {
     typename FilterMap::const_iterator filter_pos_;
     KeyType current_;
 };
+using EventSimpleRangeGenerator = FilteredRangeGenerator<SyncEventState::ScopeMap>;
+
+// Templated to allow for different Range generators or map sources...
 
 // Generate the ranges that are the intersection of the RangeGen ranges and the entries in the FilterMap
 // Note that begin *cannot* reset RangeGen (image range generation currently doesn't support it), so you can only iterate over
 // this generator once.
 template <typename FilterMap, typename RangeGen, typename KeyType = typename FilterMap::key_type>
 class FilteredGeneratorGenerator {
+  public:
     FilteredGeneratorGenerator(const FilterMap &filter, RangeGen &gen) : filter_(&filter), gen_(&gen), filter_pos_(), current_() {}
-    KeyType &operator*() const { return *current_; }
-    KeyType *operator->() const { return &*current_; }
+    const KeyType &operator*() const { return current_; }
+    const KeyType *operator->() const { return &current_; }
     FilteredGeneratorGenerator &operator++() {
-        auto gen_range = *gen_;
-        auto filter_range = FilterRange();
+        KeyType gen_range = GenRange();
+        KeyType filter_range = FilterRange();
         current_ = KeyType();
         while (gen_range.valid() && filter_range.valid() && current_.empty()) {
             if (gen_range.end > filter_range.end) {
@@ -316,15 +321,16 @@ class FilteredGeneratorGenerator {
             }
             current_ = gen_range & filter_range;
         }
+        return *this;
     }
     FilteredGeneratorGenerator &begin() {
-        auto gen_range = *gen_;
+        auto gen_range = GenRange();
         if (gen_range.empty()) {
             current_ = KeyType();
             filter_pos_ = filter->cend();
         } else {
             filter_pos_ = filter_->find(gen_range);
-            current_ = *gen_range & FilterRange();
+            current_ = gen_range & FilterRange();
         }
         return *this;
     }
@@ -333,24 +339,27 @@ class FilteredGeneratorGenerator {
     bool operator==(const FilteredGeneratorGenerator &other) const { return current_ == other.current_; }
 
   private:
-    void AdvanceFilter() {
+    KeyType AdvanceFilter() {
         ++filter_pos_;
         auto filter_range = FilterRange();
         if (filter_range.valid()) {
             FastForwardGen(filter_range);
         }
+        return filter_range;
     }
-    void AdvanceGen() {
-        ++gen_;
-        auto gen_range = *gen_;
+    KeyType AdvanceGen() {
+        ++(*gen_);
+        auto gen_range = GenRange();
         if (gen_range.valid()) {
             FastForwardFilter(gen_range);
         }
+        return gen_range;
     }
 
-    KeyType FilterRange() const { return (filter_pos_ != filter_->cend()) filter_pos_->first : KeyType(); }
+    KeyType FilterRange() const { return (filter_pos_ != filter_->cend()) ? filter_pos_->first : KeyType(); }
+    KeyType GenRange() const { return *(*gen_); }
 
-    KeyType FastFowardFilter(const KeyType &range) {
+    KeyType FastForwardFilter(const KeyType &range) {
         auto filter_range = FilterRange();
         int retry_count = 0;
         const static int kRetryLimit = 2;  // TODO -- determine wheter this limit is optimal
@@ -370,11 +379,11 @@ class FilteredGeneratorGenerator {
 
     // TODO: Consider adding "seek" (or an absolute bound "get" to range generators to make this walk
     // faster.
-    KeyType FastFowardGen(const KeyType &range) {
-        auto gen_range = *gen_;
+    KeyType FastForwardGen(const KeyType &range) {
+        auto gen_range = GenRange();
         while (!gen_range.empty() && (gen_range.end <= range.begin)) {
-            ++gen_;
-            gen_range = *gen_;
+            ++(*gen_);
+            gen_range = GenRange();
         }
         return gen_range;
     }
@@ -385,6 +394,8 @@ class FilteredGeneratorGenerator {
     typename FilterMap::const_iterator filter_pos_;
     KeyType current_;
 };
+
+using EventImageRangeGenerator = FilteredGeneratorGenerator<SyncEventState::ScopeMap, subresource_adapter::ImageRangeGenerator>;
 
 // Expand the pipeline stage without regard to whether the are valid w.r.t. queue or extension
 VkPipelineStageFlags ExpandPipelineStages(VkQueueFlags queue_flags, VkPipelineStageFlags stage_mask) {
@@ -1358,6 +1369,7 @@ template <typename Action>
 void UpdateMemoryAccessState(ResourceAccessRangeMap *accesses, const ResourceAccessRange &range, const Action &action) {
     // TODO: Optimization for operations that do a pure overwrite (i.e. WRITE usages which rewrite the state, vs READ usages
     //       that do incrementalupdates
+    assert(accesses);
     auto pos = accesses->lower_bound(range);
     if (pos == accesses->end() || !pos->first.intersects(range)) {
         // The range is empty, fill it with a default value.
@@ -1571,6 +1583,16 @@ void AccessContext::UpdateResourceAccess(const IMAGE_STATE &image, const VkImage
     }
 }
 
+template <typename Action, typename RangeGen>
+void AccessContext::UpdateResourceAccess(AccessAddressType address_type, const Action &action, RangeGen *range_gen_arg) {
+    assert(range_gen_arg);
+    auto &accesses = GetAccessStateMap(address_type);
+    auto &range_gen = *range_gen_arg;  // Non-const references must be * by style requirement but deref-ing * iterator is a pain
+    for (; range_gen->non_empty(); ++range_gen) {
+        UpdateMemoryAccessState(&accesses, *range_gen, action);
+    }
+}
+
 void AccessContext::UpdateAttachmentResolveAccess(const RENDER_PASS_STATE &rp_state, const VkRect2D &render_area,
                                                   const std::vector<const IMAGE_VIEW_STATE *> &attachment_views, uint32_t subpass,
                                                   const ResourceUsageTag &tag) {
@@ -1625,6 +1647,27 @@ void AccessContext::ApplyGlobalBarriers(const Action &barrier_action) {
     for (const auto address_type : kAddressTypes) {
         UpdateMemoryAccessState(&GetAccessStateMap(address_type), full_range, barrier_action);
     }
+}
+
+// ZZZ WIP -- current not invoking the EVENT variant of the barrier functor (cause it doesn't exist)
+void AccessContext::ApplyGlobalBarriers(const SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
+                                        const SyncStageAccessFlags &dst_stage_accesses, uint32_t memory_barrier_count,
+                                        const VkMemoryBarrier *pMemoryBarriers, const ResourceUsageTag &tag) {
+    std::vector<PipelineBarrierOp> barrier_ops;
+    barrier_ops.reserve(std::min<uint32_t>(memory_barrier_count, 1));
+    for (uint32_t barrier_index = 0; barrier_index < memory_barrier_count; barrier_index++) {
+        const auto &barrier = pMemoryBarriers[barrier_index];
+        SyncBarrier sync_barrier(sync_event.exec_scope,
+                                 SyncStageAccess::AccessScope(sync_event.stage_accesses, barrier.srcAccessMask), dst_exec_scope,
+                                 SyncStageAccess::AccessScope(dst_stage_accesses, barrier.dstAccessMask));
+        barrier_ops.emplace_back(sync_barrier, false);
+    }
+    if (0 == memory_barrier_count) {
+        // If there are no global memory barriers, force an exec barrier
+        barrier_ops.emplace_back(SyncBarrier(sync_event.exec_scope, 0, dst_exec_scope, 0), false);
+    }
+    ApplyBarrierOpsFunctor<PipelineBarrierOp> barriers_functor(true /* resolve */, barrier_ops, tag);
+    ApplyGlobalBarriers(barriers_functor);
 }
 
 void AccessContext::ResolveChildContexts(const std::vector<AccessContext> &contexts) {
@@ -2172,21 +2215,19 @@ void CommandBufferAccessContext::RecordSetEvent(VkCommandBuffer commandBuffer, V
     // Given:
     //     Stuff1; SetEvent; Stuff2; SetEvent; WaitEvents;
     // WaitEvents cannot know which of Stuff1, Stuff2, or both has completed execution.
+
+    sync_event->stage_mask = ExpandPipelineStages(GetQueueFlags(), stageMask);
+    sync_event->stage_accesses = SyncStageAccess::AccessScopeByStage(sync_event->stage_mask);
+    sync_event->exec_scope = WithEarlierPipelineStages(sync_event->stage_mask);
+
     if (!sync_event->barrier_since_last && (sync_event->last_command != CMD_SETEVENT)) {
         sync_event->ResetFirstScope();
         sync_event->unsynchronized_set_set;
     } else if ((sync_event->last_command != CMD_WAITEVENTS)) {
-        // We'll skip updating the first sync scope map only for Wait;Set -- as we can be sure (that for the cases we care about
-        // the Set will be noop'd.  Whether it is or not is undefined. (or at best implementation dependent)
-        const auto exec_scope = WithEarlierPipelineStages(ExpandPipelineStages(GetQueueFlags(), stageMask));
-        // We use the expanded and logically earlier, and us the expanded definition for access to catch every possible write at
-        // those stages, as we don't know what the srcAccessMask will be until Wait time
-        const auto scope_accesses = SyncStageAccess::AccessScopeByStage(exec_scope);
         // What happens with two SetEvent calls is undefined, so pick the easiest to implement, each Set nukes the previous
-        auto set_scope = [&sync_event, exec_scope, scope_accesses](AccessAddressType address_type,
-                                                                   const ResourceAccessRangeMap::value_type &access) {
+        auto set_scope = [&sync_event](AccessAddressType address_type, const ResourceAccessRangeMap::value_type &access) {
             auto &scope_map = sync_event->first_scope[static_cast<size_t>(address_type)];
-            if (access.second.InSourceScopeOrChain(exec_scope, scope_accesses)) {
+            if (access.second.InSourceScopeOrChain(sync_event->exec_scope, sync_event->stage_accesses)) {
                 scope_map.insert(scope_map.end(), std::make_pair(access.first, true));
             }
         };
@@ -2197,7 +2238,6 @@ void CommandBufferAccessContext::RecordSetEvent(VkCommandBuffer commandBuffer, V
     sync_event->last_command = CMD_SETEVENT;
     sync_event->barrier_since_last = false;
     sync_event->last_wait_dst_stage_mask = 0;
-    sync_event->set_stage_mask = stageMask;
 }
 
 bool CommandBufferAccessContext::ValidateResetEvent(VkCommandBuffer commandBuffer, VkEvent event,
@@ -2297,10 +2337,6 @@ bool CommandBufferAccessContext::ValidateWaitEvents(VkCommandBuffer commandBuffe
                                           CommandTypeString(sync_event->last_command), dire_warning);
 
         } else if (imageMemoryBarrierCount) {
-            const auto src_stage_mask = ExpandPipelineStages(GetQueueFlags(), sync_event->set_stage_mask);
-            auto src_stage_accesses = SyncStageAccess::AccessScopeByStage(src_stage_mask);
-
-            const auto src_exec_scope = WithEarlierPipelineStages(src_stage_mask);
             const auto *context = GetCurrentAccessContext();
             assert(context);
             for (uint32_t barrier_index = 0; barrier_index < imageMemoryBarrierCount; barrier_index++) {
@@ -2309,9 +2345,9 @@ bool CommandBufferAccessContext::ValidateWaitEvents(VkCommandBuffer commandBuffe
                 const auto *image_state = sync_state_->Get<IMAGE_STATE>(barrier.image);
                 if (!image_state) continue;
                 auto subresource_range = NormalizeSubresourceRange(image_state->createInfo, barrier.subresourceRange);
-                const auto src_access_scope = SyncStageAccess::AccessScope(src_stage_accesses, barrier.srcAccessMask);
+                const auto src_access_scope = SyncStageAccess::AccessScope(sync_event->stage_accesses, barrier.srcAccessMask);
                 const auto hazard =
-                    context->DetectImageBarrierHazard(*image_state, src_exec_scope, src_access_scope, subresource_range,
+                    context->DetectImageBarrierHazard(*image_state, sync_event->exec_scope, src_access_scope, subresource_range,
                                                       *sync_event, AccessContext::DetectOptions::kDetectAll);
                 if (hazard.hazard) {
                     const char *const cmd_name = CommandTypeString(cmd);
@@ -3181,6 +3217,50 @@ void SyncValidator::ApplyImageBarriers(AccessContext *context, VkPipelineStageFl
         const SyncBarrier sync_barrier(src_exec_scope, src_access_scope, dst_exec_scope, dst_access_scope);
         const ApplyBarrierFunctor barrier_action(sync_barrier, layout_transition);
         context->UpdateResourceAccess(*image, subresource_range, barrier_action);
+    }
+}
+
+// ZZZ WIP -- current not invoking the EVENT variant of the barrier functor (cause it doesn't exist)
+void AccessContext::ApplyBufferBarriers(const SyncValidator &sync_state, const SyncEventState &sync_event,
+                                        VkPipelineStageFlags dst_exec_scope, const SyncStageAccessFlags &dst_stage_accesses,
+                                        uint32_t barrier_count, const VkBufferMemoryBarrier *barriers) {
+    for (uint32_t index = 0; index < barrier_count; index++) {
+        auto barrier = barriers[index];  // barrier is a copy
+        const auto *buffer = sync_state.Get<BUFFER_STATE>(barrier.buffer);
+        if (!buffer) continue;
+        const auto base_address = ResourceBaseAddress(*buffer);
+        barrier.size = GetBufferWholeSize(*buffer, barrier.offset, barrier.size);
+        const ResourceAccessRange range = MakeRange(barrier) + base_address;
+        const auto src_access_scope = SyncStageAccess::AccessScope(sync_event.stage_accesses, barrier.srcAccessMask);
+        const auto dst_access_scope = SyncStageAccess::AccessScope(dst_stage_accesses, barrier.dstAccessMask);
+        const SyncBarrier sync_barrier(sync_event.exec_scope, src_access_scope, dst_exec_scope, dst_access_scope);
+        const ApplyBarrierFunctor barrier_action(sync_barrier, false /* layout_transition */);
+        const auto address_type = AccessAddressType::kLinear;
+        EventSimpleRangeGenerator filtered_range_gen(sync_event.FirstScope(address_type), range);
+        UpdateResourceAccess(address_type, barrier_action, &filtered_range_gen);
+    }
+}
+
+// ZZZ WIP -- current not invoking the EVENT variant of the barrier functor (cause it doesn't exist)
+void AccessContext::ApplyImageBarriers(const SyncValidator &sync_state, const SyncEventState &sync_event,
+                                       VkPipelineStageFlags dst_exec_scope, const SyncStageAccessFlags &dst_stage_accesses,
+                                       uint32_t barrier_count, const VkImageMemoryBarrier *barriers, const ResourceUsageTag &tag) {
+    for (uint32_t index = 0; index < barrier_count; index++) {
+        const auto &barrier = barriers[index];
+        const auto *image = sync_state.Get<IMAGE_STATE>(barrier.image);
+        if (!image) continue;
+        auto subresource_range = NormalizeSubresourceRange(image->createInfo, barrier.subresourceRange);
+        bool layout_transition = barrier.oldLayout != barrier.newLayout;
+        const auto src_access_scope = SyncStageAccess::AccessScope(sync_event.stage_accesses, barrier.srcAccessMask);
+        const auto dst_access_scope = SyncStageAccess::AccessScope(dst_stage_accesses, barrier.dstAccessMask);
+        const SyncBarrier sync_barrier(sync_event.exec_scope, src_access_scope, dst_exec_scope, dst_access_scope);
+        const ApplyBarrierFunctor barrier_action(sync_barrier, layout_transition);
+        const auto base_address = ResourceBaseAddress(*image);
+        subresource_adapter::ImageRangeGenerator range_gen(*image->fragment_encoder.get(), subresource_range, {0, 0, 0},
+                                                           image->createInfo.extent, base_address);
+        const auto address_type = ImageAddressType(*image);
+        EventImageRangeGenerator filtered_range_gen(sync_event.FirstScope(address_type), range_gen);
+        UpdateResourceAccess(address_type, barrier_action, &filtered_range_gen);
     }
 }
 
