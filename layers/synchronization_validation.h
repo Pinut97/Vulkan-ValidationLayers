@@ -209,6 +209,7 @@ class ResourceAccessState : public SyncStageAccess {
     void ApplyBarriers(const std::vector<SyncBarrier> &barriers, bool layout_transition);
     void ApplyBarriers(const std::vector<SyncBarrier> &barriers, const ResourceUsageTag &tag);
     void ApplyBarrier(const SyncBarrier &barrier, bool layout_transition);
+    void ApplyBarrier(const ResourceUsageTag &scope_tag, const SyncBarrier &barrier, bool layout_transition);
     void ApplyPendingBarriers(const ResourceUsageTag &tag);
 
     ResourceAccessState()
@@ -425,9 +426,6 @@ class AccessContext {
     template <typename Action>
     void UpdateResourceAccess(const IMAGE_STATE &image, const VkImageSubresourceRange &subresource_range, const Action action);
 
-    template <typename Action, typename RangeGen>
-    void UpdateResourceAccess(AccessAddressType address_type, const Action &action, RangeGen *range_gen);
-
     template <typename Action>
     void ApplyGlobalBarriers(const Action &barrier_action);
     void AccessContext::ApplyGlobalBarriers(const SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
@@ -590,7 +588,7 @@ class CommandBufferAccessContext {
                           VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask, uint32_t memoryBarrierCount,
                           const VkMemoryBarrier *pMemoryBarriers, uint32_t bufferMemoryBarrierCount,
                           const VkBufferMemoryBarrier *pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount,
-                          const VkImageMemoryBarrier *pImageMemoryBarriers) const;
+                          const VkImageMemoryBarrier *pImageMemoryBarriers, const ResourceUsageTag &tag);
 
     CMD_BUFFER_STATE *GetCommandBufferState() { return cb_state_.get(); }
     const CMD_BUFFER_STATE *GetCommandBufferState() const { return cb_state_.get(); }
