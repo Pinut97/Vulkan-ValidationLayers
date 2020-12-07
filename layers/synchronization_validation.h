@@ -367,14 +367,6 @@ class AccessContext {
     void RecordLayoutTransitions(const RENDER_PASS_STATE &rp_state, uint32_t subpass,
                                  const std::vector<const IMAGE_VIEW_STATE *> &attachment_views, const ResourceUsageTag &tag);
 
-    void ApplyBufferBarriers(const SyncValidator &sync_state, const SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
-                             const SyncStageAccessFlags &dst_stage_accesses, uint32_t barrier_count,
-                             const VkBufferMemoryBarrier *barriers);
-
-    void ApplyImageBarriers(const SyncValidator &sync_state, const SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
-                            const SyncStageAccessFlags &dst_stage_accesses, uint32_t barrier_count,
-                            const VkImageMemoryBarrier *barriers, const ResourceUsageTag &tag);
-
     const TrackBack &GetDstExternalTrackBack() const { return dst_external_; }
     void Reset() {
         prev_.clear();
@@ -428,9 +420,6 @@ class AccessContext {
 
     template <typename Action>
     void ApplyGlobalBarriers(const Action &barrier_action);
-    void AccessContext::ApplyGlobalBarriers(const SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
-                                            const SyncStageAccessFlags &dst_stage_accesses, uint32_t memory_barrier_count,
-                                            const VkMemoryBarrier *pMemoryBarriers, const ResourceUsageTag &tag);
     static AccessAddressType ImageAddressType(const IMAGE_STATE &image);
 
     AccessContext(uint32_t subpass, VkQueueFlags queue_flags, const std::vector<SubpassDependencyGraphNode> &dependencies,
@@ -560,6 +549,15 @@ class CommandBufferAccessContext {
     AccessContext *GetCurrentAccessContext() { return current_context_; }
     const AccessContext *GetCurrentAccessContext() const { return current_context_; }
     void RecordBeginRenderPass(const ResourceUsageTag &tag);
+    void ApplyBufferBarriers(const SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
+                             const SyncStageAccessFlags &dst_stage_accesses, uint32_t barrier_count,
+                             const VkBufferMemoryBarrier *barriers);
+    void ApplyGlobalBarriers(SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
+                             const SyncStageAccessFlags &dst_stage_accesses, uint32_t memory_barrier_count,
+                             const VkMemoryBarrier *pMemoryBarriers, const ResourceUsageTag &tag);
+    void ApplyImageBarriers(const SyncEventState &sync_event, VkPipelineStageFlags dst_exec_scope,
+                            const SyncStageAccessFlags &dst_stage_accesses, uint32_t barrier_count,
+                            const VkImageMemoryBarrier *barriers, const ResourceUsageTag &tag);
     bool ValidateBeginRenderPass(const RENDER_PASS_STATE &render_pass, const VkRenderPassBeginInfo *pRenderPassBegin,
                                  const VkSubpassBeginInfoKHR *pSubpassBeginInfo, const char *func_name) const;
     bool ValidateDispatchDrawDescriptorSet(VkPipelineBindPoint pipelineBindPoint, const char *func_name) const;
