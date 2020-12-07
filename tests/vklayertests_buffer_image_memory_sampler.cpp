@@ -12428,6 +12428,7 @@ TEST_F(VkLayerTest, VerityUnnormalizedCoordinatesSampler) {
 }
 
 TEST_F(VkSyncValTest, SyncBufferCopyHazards) {
+    TEST_DESCRIPTION("Check hazard condtion report for a variety of buffer copy operations");
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     if (DeviceExtensionSupported(gpu(), nullptr, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
         m_device_extension_names.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
@@ -12562,6 +12563,105 @@ TEST_F(VkSyncValTest, SyncBufferCopyHazards) {
     } else {
         printf("%s Test requires unsupported vkCmdWriteBufferMarkerAMD feature. Skipped.\n", kSkipPrefix);
     }
+}
+
+TEST_F(VkSyncValTest, SyncEventsBufferCopy) {
+    TEST_DESCRIPTION("Check Set/Wait protection for a variety of use cases using buffer copies");
+    ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
+    ASSERT_NO_FATAL_FAILURE(InitState(nullptr, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT));
+
+    VkBufferObj buffer_a;
+    VkBufferObj buffer_b;
+    VkBufferObj buffer_c;
+    VkMemoryPropertyFlags mem_prop = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    buffer_a.init_as_src_and_dst(*m_device, 256, mem_prop);
+    buffer_b.init_as_src_and_dst(*m_device, 256, mem_prop);
+    buffer_c.init_as_src_and_dst(*m_device, 256, mem_prop);
+
+    VkBufferCopy region = {0, 0, 256};
+    VkBufferCopy front2front = {0, 0, 128};
+    VkBufferCopy front2back = {0, 128, 128};
+    VkBufferCopy back2back = {128, 128, 128};
+
+    VkEventObj event;
+    event.init(*m_device, VkEventObj::create_info(0));
+    VkEvent event_handle = event.handle();
+
+    auto cb = m_commandBuffer->handle();
+    m_commandBuffer->begin();
+
+    // Copy after set for WAR (note we are writing to the back half of c but only reading from the front
+    m_errorMonitor->ExpectSuccess();
+    vk::CmdCopyBuffer(cb, buffer_a.handle(), buffer_b.handle(), 1, &region);
+    m_commandBuffer->SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    vk::CmdCopyBuffer(cb, buffer_a.handle(), buffer_c.handle(), 1, &back2back);
+    m_commandBuffer->WaitEvents(1, &event_handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, 0,
+                                nullptr, 0, nullptr);
+    vk::CmdCopyBuffer(cb, buffer_c.handle(), buffer_a.handle(), 1, &front2front);
+    m_errorMonitor->VerifyNotFound();
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_READ");
+    vk::CmdCopyBuffer(cb, buffer_c.handle(), buffer_a.handle(), 1, &front2back);
+    m_errorMonitor->VerifyFound();
+    m_commandBuffer->end();
+
+    // WAR prevented
+    m_commandBuffer->reset();
+    m_commandBuffer->begin();
+    m_errorMonitor->ExpectSuccess();
+    vk::CmdCopyBuffer(cb, buffer_a.handle(), buffer_b.handle(), 1, &region);
+    m_commandBuffer->SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // Just protect against WAR, only need a sync barrier.
+    m_commandBuffer->WaitEvents(1, &event_handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, 0,
+                                nullptr, 0, nullptr);
+    vk::CmdCopyBuffer(cb, buffer_c.handle(), buffer_a.handle(), 1, &region);
+    m_errorMonitor->VerifyNotFound();
+
+    // Wait shouldn't prevent this WAW though, as it's only a synchronization barrier
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_WRITE");
+    vk::CmdCopyBuffer(cb, buffer_c.handle(), buffer_b.handle(), 1, &region);
+    m_errorMonitor->VerifyFound();
+    m_commandBuffer->end();
+
+    // Prevent WAR and WAW
+    m_commandBuffer->reset();
+    m_commandBuffer->begin();
+    m_errorMonitor->ExpectSuccess();
+    vk::CmdCopyBuffer(cb, buffer_a.handle(), buffer_b.handle(), 1, &region);
+    m_commandBuffer->SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    auto mem_barrier_waw = lvl_init_struct<VkMemoryBarrier>();
+    mem_barrier_waw.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mem_barrier_waw.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    m_commandBuffer->WaitEvents(1, &event_handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1,
+                                &mem_barrier_waw, 0, nullptr, 0, nullptr);
+    // The WAW should be safe (on a memory barrier)
+    vk::CmdCopyBuffer(cb, buffer_c.handle(), buffer_b.handle(), 1, &region);
+    // The WAR should also be safe (on a sync barrier)
+    vk::CmdCopyBuffer(cb, buffer_c.handle(), buffer_a.handle(), 1, &region);
+    m_errorMonitor->VerifyNotFound();
+    m_commandBuffer->end();
+
+    // Barrier range check for WAW
+    auto buffer_barrier_front_waw = lvl_init_struct<VkBufferMemoryBarrier>();
+    buffer_barrier_front_waw.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    buffer_barrier_front_waw.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    buffer_barrier_front_waw.buffer = buffer_b.handle();
+    buffer_barrier_front_waw.offset = front2front.dstOffset;
+    buffer_barrier_front_waw.size = front2front.size;
+
+    // Front safe, back WAW
+    m_commandBuffer->reset();
+    m_commandBuffer->begin();
+    m_errorMonitor->ExpectSuccess();
+    vk::CmdCopyBuffer(cb, buffer_a.handle(), buffer_b.handle(), 1, &region);
+    m_commandBuffer->SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    m_commandBuffer->WaitEvents(1, &event_handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, 1,
+                                &buffer_barrier_front_waw, 0, nullptr);
+    vk::CmdCopyBuffer(cb, buffer_a.handle(), buffer_b.handle(), 1, &front2front);
+    m_errorMonitor->VerifyNotFound();
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_WRITE");
+    vk::CmdCopyBuffer(cb, buffer_a.handle(), buffer_b.handle(), 1, &back2back);
+    m_errorMonitor->VerifyFound();
+    m_commandBuffer->end();
 }
 
 TEST_F(VkSyncValTest, SyncCopyOptimalImageHazards) {
@@ -13077,6 +13177,200 @@ TEST_F(VkSyncValTest, SyncCopyLinearMultiPlanarHazards) {
     m_errorMonitor->VerifyNotFound();
 
     m_commandBuffer->end();
+}
+TEST_F(VkSyncValTest, SyncEventsCopyImageHazards) {
+    ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
+    ASSERT_NO_FATAL_FAILURE(InitState(nullptr, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT));
+
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    VkImageObj image_a(m_device);
+    auto image_ci = VkImageObj::ImageCreateInfo2D(128, 128, 1, 2, format, usage, VK_IMAGE_TILING_OPTIMAL);
+    image_a.Init(image_ci);
+    ASSERT_TRUE(image_a.initialized());
+
+    VkImageObj image_b(m_device);
+    image_b.Init(image_ci);
+    ASSERT_TRUE(image_b.initialized());
+
+    VkImageObj image_c(m_device);
+    image_c.Init(image_ci);
+    ASSERT_TRUE(image_c.initialized());
+
+    VkEventObj event;
+    event.init(*m_device, VkEventObj::create_info(0));
+    VkEvent event_handle = event.handle();
+
+    VkImageSubresourceLayers layers_all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2};
+    VkImageSubresourceLayers layers_0{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    VkImageSubresourceLayers layers_1{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1};
+    VkImageSubresourceRange full_subresource_range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+    VkImageSubresourceRange layers_0_subresource_range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageSubresourceRange layers_1_subresource_range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1, 1};
+    VkOffset3D zero_offset{0, 0, 0};
+    VkOffset3D half_offset{64, 64, 0};
+    VkExtent3D full_extent{128, 128, 1};  // <-- image type is 2D
+    VkExtent3D half_extent{64, 64, 1};    // <-- image type is 2D
+
+    VkImageCopy full_region = {layers_all, zero_offset, layers_all, zero_offset, full_extent};
+    VkImageCopy region_0_to_0 = {layers_0, zero_offset, layers_0, zero_offset, full_extent};
+    VkImageCopy region_0_to_1 = {layers_0, zero_offset, layers_1, zero_offset, full_extent};
+    VkImageCopy region_1_to_1 = {layers_1, zero_offset, layers_1, zero_offset, full_extent};
+    VkImageCopy region_0_q0toq0 = {layers_0, zero_offset, layers_0, zero_offset, half_extent};
+    VkImageCopy region_0_q0toq3 = {layers_0, zero_offset, layers_0, half_offset, half_extent};
+    VkImageCopy region_0_q3toq3 = {layers_0, half_offset, layers_0, half_offset, half_extent};
+
+    auto cb = m_commandBuffer->handle();
+    auto copy_general = [cb](const VkImageObj &from, const VkImageObj &to, const VkImageCopy &region) {
+        vk::CmdCopyImage(cb, from.handle(), VK_IMAGE_LAYOUT_GENERAL, to.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    };
+
+    auto set_layouts = [this, &image_a, &image_b, &image_c]() {
+        image_c.SetLayout(m_commandBuffer, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        image_b.SetLayout(m_commandBuffer, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        image_a.SetLayout(m_commandBuffer, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    };
+
+    // Scope chcek.  One access in, one access not
+    m_commandBuffer->begin();
+    set_layouts();
+    m_errorMonitor->ExpectSuccess();
+    copy_general(image_a, image_b, full_region);
+    m_commandBuffer->SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    copy_general(image_a, image_c, region_0_q3toq3);
+    m_commandBuffer->WaitEvents(1, &event_handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, 0,
+                                nullptr, 0, nullptr);
+    copy_general(image_c, image_a, region_0_q0toq0);
+    m_errorMonitor->VerifyNotFound();
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_READ");
+    copy_general(image_c, image_a, region_0_q0toq3);
+    m_errorMonitor->VerifyFound();
+    m_commandBuffer->end();
+
+    // WAR prevented
+    m_commandBuffer->reset();
+    m_commandBuffer->begin();
+    set_layouts();
+    m_errorMonitor->ExpectSuccess();
+    copy_general(image_a, image_b, full_region);
+    m_commandBuffer->SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // Just protect against WAR, only need a sync barrier.
+    m_commandBuffer->WaitEvents(1, &event_handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, 0,
+                                nullptr, 0, nullptr);
+    copy_general(image_c, image_a, full_region);
+    m_errorMonitor->VerifyNotFound();
+
+    // Wait shouldn't prevent this WAW though, as it's only a synchronization barrier
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_WRITE");
+    copy_general(image_c, image_b, full_region);
+    m_errorMonitor->VerifyFound();
+    m_commandBuffer->end();
+
+    // Prevent WAR and WAW
+    m_commandBuffer->reset();
+    m_commandBuffer->begin();
+    m_errorMonitor->ExpectSuccess();
+    set_layouts();
+    copy_general(image_a, image_b, full_region);
+    m_commandBuffer->SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    auto mem_barrier_waw = lvl_init_struct<VkMemoryBarrier>();
+    mem_barrier_waw.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mem_barrier_waw.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    m_commandBuffer->WaitEvents(1, &event_handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1,
+                                &mem_barrier_waw, 0, nullptr, 0, nullptr);
+    // The WAW should be safe (on a memory barrier)
+    copy_general(image_c, image_b, full_region);
+    // The WAR should also be safe (on a sync barrier)
+    copy_general(image_c, image_a, full_region);
+    m_errorMonitor->VerifyNotFound();
+    m_commandBuffer->end();
+
+    // Barrier range check for WAW
+    auto image_barrier_region0_waw = lvl_init_struct<VkImageMemoryBarrier>();
+    image_barrier_region0_waw.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    image_barrier_region0_waw.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    image_barrier_region0_waw.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_barrier_region0_waw.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_barrier_region0_waw.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_barrier_region0_waw.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    image_barrier_region0_waw.image = image_b.handle();
+    image_barrier_region0_waw.subresourceRange = layers_0_subresource_range;
+
+    // Region 0 safe, back WAW
+    m_commandBuffer->reset();
+    m_commandBuffer->begin();
+    set_layouts();
+    m_errorMonitor->ExpectSuccess();
+    copy_general(image_a, image_b, full_region);
+    m_commandBuffer->SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    m_commandBuffer->WaitEvents(1, &event_handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, 0,
+                                nullptr, 1, &image_barrier_region0_waw);
+    copy_general(image_a, image_b, region_0_to_0);
+    m_errorMonitor->VerifyNotFound();
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_WRITE");
+    copy_general(image_a, image_b, region_1_to_1);
+    m_errorMonitor->VerifyFound();
+    m_commandBuffer->end();
+
+#if 0
+    // Use the barrier to clean up the WAW, and try again. (and show that validation is accounting for the barrier effect too.)
+    auto image_barrier = lvl_init_struct<VkImageMemoryBarrier>();
+    image_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    image_barrier.image = image_a.handle();
+    image_barrier.subresourceRange = full_subresource_range;
+    image_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    vk::CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+        &image_barrier);
+
+    m_errorMonitor->ExpectSuccess();
+    vk::CmdCopyImage(cb, image_c.handle(), VK_IMAGE_LAYOUT_GENERAL, image_a.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &region_0_to_0);
+    vk::CmdCopyImage(cb, image_c.handle(), VK_IMAGE_LAYOUT_GENERAL, image_a.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &region_1_to_1);
+    m_errorMonitor->VerifyNotFound();
+
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_WRITE");
+    vk::CmdCopyImage(cb, image_c.handle(), VK_IMAGE_LAYOUT_GENERAL, image_a.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &region_0_to_1);
+    m_errorMonitor->VerifyFound();
+
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_WRITE");
+    vk::CmdCopyImage(cb, image_c.handle(), VK_IMAGE_LAYOUT_GENERAL, image_b.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &full_region);
+    m_errorMonitor->VerifyFound();
+
+    // NOTE: Since the previous command skips in validation, the state update is never done, and the validation layer thus doesn't
+    //       record the write operation to b.  So we'll need to repeat it successfully to set up for the *next* test.
+
+    // Use the barrier to clean up the WAW, and try again. (and show that validation is accounting for the barrier effect too.)
+    auto mem_barrier = lvl_init_struct<VkMemoryBarrier>();
+    mem_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mem_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vk::CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0,
+        nullptr);
+    m_errorMonitor->ExpectSuccess();
+    vk::CmdCopyImage(cb, image_c.handle(), VK_IMAGE_LAYOUT_GENERAL, image_b.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &full_region);
+    m_errorMonitor->VerifyNotFound();
+
+    // Use barrier to protect last reader, but not last writer...
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-READ_AFTER_WRITE");
+    mem_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;  // Protects C but not B
+    mem_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vk::CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem_barrier, 0, nullptr, 0,
+        nullptr);
+    vk::CmdCopyImage(cb, image_b.handle(), VK_IMAGE_LAYOUT_GENERAL, image_c.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &full_region);
+    m_errorMonitor->VerifyFound();
+
+    vk::CmdCopyImage(cb, image_c.handle(), VK_IMAGE_LAYOUT_GENERAL, image_a.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &region_0_front);
+    m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_WRITE");
+    vk::CmdCopyImage(cb, image_c.handle(), VK_IMAGE_LAYOUT_GENERAL, image_a.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &region_0_front);
+    m_errorMonitor->VerifyFound();
+
+    m_errorMonitor->ExpectSuccess();
+    vk::CmdCopyImage(cb, image_c.handle(), VK_IMAGE_LAYOUT_GENERAL, image_a.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &region_0_back);
+    m_errorMonitor->VerifyNotFound();
+
+    m_commandBuffer->end();
+
+#endif
 }
 
 TEST_F(VkSyncValTest, SyncCopyBufferImageHazards) {
